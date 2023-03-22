@@ -1,11 +1,24 @@
-/* GPU-based correlation code for a small (<=64) input
- * sampling system to run on a workstation class computer. There is an
- * upper limit to the number of supported channels due to the max number
- * of threads that can be on the GPU. This is currently 512.
+/* GPU-based correlation code for a workstation class computer using CUDA.
+ * This is an FX correlator and will be most efficient for a large-N system.
  *
  * Author: Randall Wayth. Feb, 2009.
  *
  * to compile with CUDA: nvcc -O -o corr_gpu_complex corr_gpu_complex.cu -lcufft
+ 
+ This code was developed for the MWA 32T era, and is based on the paper
+ https://ui.adsabs.harvard.edu/abs/2009PASP..121..857W/abstract
+ 
+ See also https://ui.adsabs.harvard.edu/abs/2008ExA....22..129H/abstract
+ 
+ This correlator is designed to be part of a streaming system, and expects the input to be a stream
+ of interleaved samples of some type. The code has evolved over time to support different input types
+ (run the code with -help for a summary). The code just does correlation and accumulation and does not
+ apply any kind of corrections or fringe tracking to data - this is assumed to be done post correlation.
+ 
+ The design of this code is described in more detail in the paper above, but explicitly incorporates
+ a channelisation step via FFT and takes advantage of the natural data ordering post FFT to avoid
+ data reordering before and after correlation.
+ 
 */
 
 #include <stdio.h>
@@ -22,12 +35,10 @@
 #include <cufft.h>
 #include <fcntl.h>
 
-//#include "/home/rwayth/Desktop/gxc_kernels.h"
-
-#define MAX_THREADS 128
+#define MAX_THREADS 512
 #define MAX_INPUTS 256
 #define MAX_CORR_PROD (MAX_INPUTS*(MAX_INPUTS+1)/2)
-#define MAX_CHAN 128
+#define MAX_CHAN (MAX_THREADS/4)    // this is limited by the number of threads that a GPU can support
 //#define GRPSIZ 2    // this cannot be changed from 2 without rewriting the 1xG CMAC function.
 #define INTMULT(a,b) __mul24((a),(b))
 //#define INTMULT(a,b) (a)*(b)
@@ -98,10 +109,13 @@ int wordtype=DATATYPE_COMPLEX_SIGNED_BYTE,wordsize=0,complex_data=1; // input da
 int unpack_method=0;
 int cmac_method=CMAC_GxG_4;
 char *infilename=NULL,*outfilename=NULL;
-int prod_type='B';  /* correlation product type: B: both, C: cross, A: auto */
+int prod_type='B';  /* correlation product type: B: both, C: cross, A: auto, T: triangle ACC format */
 //__device__ __constant__ uint2 inp_index_gpu[MAX_CORR_PROD]; // cannot fit for 256 inputs
 __device__ uint2 inp_index_gpu[MAX_CORR_PROD];
 
+
+/********************
+********************/
 int main(int argc, char * const argv[]) {
     size_t siz_inp_buf=0,siz_ft_buf=0,siz_corr_buf=0,siz_inp_gpu=0;
     int i,nmoves=0,iter=0,nav_written=0,log2_nchan;
@@ -111,7 +125,6 @@ int main(int argc, char * const argv[]) {
     unsigned char *staging_buf=NULL,*staging_buf_gpu=NULL;
     cufftComplex *inp_buf_gpu=NULL;
     cufftComplex *ft_buf=NULL;
-    cuFloatComplex *corr_buf=NULL;
     cuFloatComplex *corr_buf_gpu=NULL;
     cudaError_t res;
     struct timeval thetime,starttime;
@@ -167,21 +180,21 @@ int main(int argc, char * const argv[]) {
     }
     
     /* staging buffer, which lives on the GPU. this holds packed (byte) data */
-    res = cudaMalloc((void **)&staging_buf_gpu,siz_inp_buf);
+    res = cudaMallocManaged((void **)&staging_buf_gpu,siz_inp_buf);
     if (res != 0) {
         fprintf(stderr,"failed to alloc device mem for staging_buf_gpu\n");
         exit(1);
     }
     
     /* input buffer, which lives on the GPU. This holds unpacked (float) data */
-    res = cudaMalloc((void **)&inp_buf_gpu,siz_inp_gpu);
+    res = cudaMallocManaged((void **)&inp_buf_gpu,siz_inp_gpu);
     if (res != 0) {
         fprintf(stderr,"failed to alloc device mem for inp_buf_gpu\n");
         exit(1);
     }
 
     /* FFT result buffer, lives on GPU only */
-    res = cudaMalloc((void **)&ft_buf,siz_ft_buf);
+    res = cudaMallocManaged((void **)&ft_buf,siz_ft_buf);
     if (res != 0) {
         fprintf(stderr,"failed to alloc device mem for ft_buf\n");
         exit(1);
@@ -189,16 +202,9 @@ int main(int argc, char * const argv[]) {
 
     /* for correlation products */
     /* results of CMAC on the GPU */
-    res=cudaMalloc((void **)&corr_buf_gpu,siz_corr_buf);
+    res=cudaMallocManaged((void **)&corr_buf_gpu,siz_corr_buf);
     if (res != 0) {
         fprintf(stderr,"failed to alloc device mem for corr_buf_gpu\n");
-        exit(1);
-    }
-
-    /* space on the host for CMAC results to be transferred to */
-    res=cudaMallocHost((void **)&corr_buf,siz_corr_buf);
-    if (res != 0) {
-        fprintf(stderr,"failed to alloc host mem for corr_buf\n");
         exit(1);
     }
 
@@ -243,7 +249,7 @@ int main(int argc, char * const argv[]) {
 
             /* wait for any running correlation threads to finish */
             gettimeofday(&thetime,NULL);
-            cudaDeviceSynchronize();
+            cudaStreamSynchronize(0);
             sync_time += elapsed_time(&thetime);
             if ( (res=cudaGetLastError()) != cudaSuccess) {
                 fprintf(stderr,"do_CMAC_gpu failed. Error: %s\n",cudaGetErrorString(res));
@@ -292,17 +298,22 @@ int main(int argc, char * const argv[]) {
                     fprintf(stderr,"unknown data word type %d\n",wordtype);
                     exit(1);
             }
-            cudaDeviceSynchronize(); /* must wait before starting FFT */
+            cudaStreamSynchronize(0); /* must wait before starting FFT */
             unpack_time += elapsed_time(&thetime);            
             if ( (res=cudaGetLastError()) != cudaSuccess) {
                 fprintf(stderr,"unpack_data_GPU failed. Error: %s\n",cudaGetErrorString(res));
-                goto EXIT;
+                filedone=1;
+                break;
             }
 
             /* do the FFT */
             gettimeofday(&thetime,NULL);
-            if (do_FFT_gpu(nchan,ninp,inp_buf_gpu,ft_buf) != CUFFT_SUCCESS) goto EXIT;
-            cudaDeviceSynchronize();
+            if (do_FFT_gpu(nchan,ninp,inp_buf_gpu,ft_buf) != CUFFT_SUCCESS) {
+                fprintf(stderr,"do_FFT_gpu failed. Error: %s\n",cudaGetErrorString(res));
+                filedone=1;
+                break;
+            }
+            cudaStreamSynchronize(0);
             fft_time += elapsed_time(&thetime);
 
             /* do the CMAC. don't sync after this call since the next batch of data can be read in parallel. */
@@ -315,27 +326,21 @@ int main(int argc, char * const argv[]) {
         /* write out if it is time to */
 //        if ( (filedone && iter>0) || (iter*fft_batchsize >= naver) ) {
         if ( iter*fft_batchsize >= naver ) {
-            cudaThreadSynchronize();
+            cudaStreamSynchronize(0);
             gettimeofday(&thetime,NULL);
-            /* fetch the accumulated results from the GPU */
-            res=cudaMemcpy(corr_buf,corr_buf_gpu,siz_corr_buf,cudaMemcpyDeviceToHost);
-            if (res != cudaSuccess) {
-                fprintf(stderr,"Error on memcpy of results from device to host. Message: %s\n",cudaGetErrorString(res));
-                goto EXIT;
-            }
  
-            /* reset to zero, since stuff is accumulated into these arrays */
+            writeOutput(fout_ac,fout_cc,ninp,nchan,iter,prod_type,corr_buf_gpu,1.0/(nchan*iter*fft_batchsize));
+            if(debug) fprintf(stderr,"writing average of %d chunks\n",iter*fft_batchsize);
+            iter=0;
+            nav_written++;
+            
+             /* reset to zero, since stuff is accumulated into these arrays */
             res=cudaMemset(corr_buf_gpu,'\0',siz_corr_buf);
             if (res != cudaSuccess) {
                 fprintf(stderr,"Error on memset on host. Message: %s\n",cudaGetErrorString(res));
                 goto EXIT;
-            }
-
-            gettimeofday(&thetime,NULL);
-            writeOutput(fout_ac,fout_cc,ninp,nchan,iter,prod_type,corr_buf,1.0/(nchan*iter*fft_batchsize));
-            if(debug) fprintf(stderr,"writing average of %d chunks\n",iter*fft_batchsize);
-            iter=0;
-            nav_written++;
+            }           
+            
             write_time += elapsed_time(&thetime);
         }
     }
@@ -361,7 +366,6 @@ EXIT:
     if (staging_buf != NULL) cudaFreeHost(staging_buf);
     if (ft_buf != NULL) cudaFree(ft_buf);
     if (inp_buf_gpu != NULL) cudaFree(inp_buf_gpu);
-    if (corr_buf != NULL) cudaFreeHost(corr_buf);
     if (corr_buf_gpu != NULL) cudaFree(corr_buf_gpu);
     return 0;
 }
@@ -1150,6 +1154,11 @@ void writeOutput(FILE *fout_ac, FILE *fout_cc,int ninp, int nchan, int naver, in
                 fwrite(buf+index+nchan/2,sizeof(cufftComplex),nchan/2,fout_cc);
                 fwrite(buf+index,sizeof(cufftComplex),nchan/2,fout_cc);
             }
+            if(prod_type=='T') {
+                 /* all products as complex floats including autos */
+                fwrite(buf+index+nchan/2,sizeof(cufftComplex),nchan/2,fout_cc);
+                fwrite(buf+index,sizeof(cufftComplex),nchan/2,fout_cc);
+            }
 
             /* reset the correlation products to zero */
             memset(buf+index,'\0',(nchan)*sizeof(cufftComplex));
@@ -1220,9 +1229,9 @@ int openFiles(char *infilename, char *outfilename, int prod_type, FILE **fin, FI
         }
     }
     
-    if ((prod_type=='A') && strcmp(outfilename,"-")==0) {
+    if ((prod_type=='A' ) && strcmp(outfilename,"-")==0) {
         *fout_ac = stdout;
-    } else if ((prod_type=='C') && strcmp(outfilename,"-")==0) {
+    } else if ((prod_type=='C' || prod_type=='T') && strcmp(outfilename,"-")==0) {
         *fout_cc = stdout;
     } else {
         if (prod_type=='A' || prod_type=='B') {
@@ -1237,6 +1246,15 @@ int openFiles(char *infilename, char *outfilename, int prod_type, FILE **fin, FI
         if (prod_type=='C' || prod_type=='B') {
             strncpy(tempfilename,outfilename,FILENAME_MAX-8);
             strcat(tempfilename,".LCCSPC");
+            *fout_cc = fopen(tempfilename,"w");
+            if (*fout_cc ==NULL) {
+                fprintf(stderr,"failed to open output file name: <%s>\n",tempfilename);
+                exit(1);
+            }
+        } 
+        if (prod_type=='T') {
+            strncpy(tempfilename,outfilename,FILENAME_MAX-8);
+            strcat(tempfilename,".ACC");
             *fout_cc = fopen(tempfilename,"w");
             if (*fout_cc ==NULL) {
                 fprintf(stderr,"failed to open output file name: <%s>\n",tempfilename);
@@ -1335,7 +1353,7 @@ void parse_cmdline(int argc, char * const argv[], const char *optstring) {
                 break;
             case 'p':
                 prod_type = toupper(optarg[0]);
-                if (prod_type!='A' && prod_type !='B' && prod_type != 'C') {
+                if (prod_type!='A' && prod_type !='B' && prod_type != 'C' && prod_type != 'T') {
                     fprintf(stderr,"bad correlation product type: %c\n",prod_type);
                     print_usage(argv);
                 }
@@ -1397,7 +1415,8 @@ void printGPUDetails(FILE *fp) {
 
 void print_usage(char * const argv[]) {
     fprintf(stderr,"Usage:\n%s [options]\n",argv[0]);
-    fprintf(stderr,"\t-p type\t\tspecify correlation product type(s). A: auto, C: cross, B: both. default: %c\n",prod_type);
+    fprintf(stderr,"\t-p type\t\tspecify correlation product type(s). Default: %c\n",prod_type);
+    fprintf(stderr,"\t       \tA: auto, C: cross, B: both (in separate L-files), T: both (in single triangular ACC file)\n");
     fprintf(stderr,"\t-c num\t\tspecify number of freq channels. default: %d\n",nchan);
     fprintf(stderr,"\t-n num\t\tspecify number of input streams. default: %d\n",ninp);
     fprintf(stderr,"\t-a num\t\tspecify number of averages before output. default: %d\n",naver);

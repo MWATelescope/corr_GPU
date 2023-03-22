@@ -1,0 +1,31 @@
+# simple python code to make some test data
+# this generates n_time complex noise samples for n_inp inputs with a common signal
+# with snr as specified.
+
+python3
+import numpy
+
+n_inp=32
+n_time=1024*1024*2
+snr=0.1
+sig=numpy.random.normal(scale=numpy.sqrt(snr),size=n_time)
+
+d=numpy.zeros((n_inp,n_time),dtype=numpy.float32)
+
+for i in range(n_inp):
+    d[i,:] = numpy.random.normal(size=n_time) + sig
+
+numpy.round(d*16).astype(numpy.int8).tofile('/tmp/corrtest.dat')
+
+
+
+Using the test data
+-------------------
+The above test data can be fed into the correlator as:
+
+./corr_gpu_complex -n 32 -w 10 -i /tmp/corrtest.dat -o /tmp/testout
+
+multiple copies of the data can be piped into the correlator:
+
+cat /tmp/corrtest.dat /tmp/corrtest.dat /tmp/corrtest.dat /tmp/corrtest.dat | ./corr_gpu_complex -n 32 -w 10 -i - -o /tmp/testout
+
