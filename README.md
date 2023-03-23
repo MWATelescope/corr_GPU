@@ -20,7 +20,7 @@ corr_GPU was originally built for a streaming data environment and to have simpl
 ### Input
 The input, from a file (or named pipe) or stdin, is implicitly a stream of interleaved data samples, one for each input per timestep, then the same for the next timestep etc. Input can be real or complex. There is no header or metadata in the input stream.  
 E.g for a system with 4 inputs and complex data, the input stream is
-r0,c0,r1,c1,r2,c2,r3,c3,r0,c0,r1,c1,r2,c2,r3,c3... etc for successive timesteps.
+r0,i0,r1,i1,r2,i2,r3,i3,r0,i0,r1,i1,r2,i2,r3,i3... etc for successive timesteps.
 
 The actual type of data (byte, int, float, signed or unsigned) is specified on the command-line.
 
