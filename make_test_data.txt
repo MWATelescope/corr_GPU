@@ -6,26 +6,91 @@ python3
 import numpy
 
 n_inp=32
-n_time=1024*1024*2
+n_time=10000  # this matches the default settings of 10000 times per average and 128 channels.
+n_chan=128
 snr=0.1
-sig=numpy.random.normal(scale=numpy.sqrt(snr),size=n_time)
+#snr=10.0
+sig=numpy.random.normal(scale=numpy.sqrt(snr),size=n_time*n_chan*2)
 
-d=numpy.zeros((n_inp,n_time),dtype=numpy.float32)
+d=numpy.zeros((n_time*n_chan*2,n_inp),dtype=numpy.float32)
 
 for i in range(n_inp):
-    d[i,:] = numpy.random.normal(size=n_time) + sig
+    d[:,i] = numpy.random.normal(size=n_time*n_chan*2) + sig
 
 numpy.round(d*16).astype(numpy.int8).tofile('/tmp/corrtest.dat')
 
-
+# optionally plot
+plt.plot(d[0:128,0])
+plt.plot(sig[0:128])
+plt.plot(d[0:128,1])
+plt.show()
 
 Using the test data
 -------------------
 The above test data can be fed into the correlator as:
 
-./corr_gpu_complex -n 32 -w 10 -i /tmp/corrtest.dat -o /tmp/testout
+./corr_gpu_complex -n 32 -w 10 -i /tmp/corrtest.dat -p T -o /tmp/testout
+
+(optionally test with external CPU correlator)
+corr_multi_complex -w 10 -n 32 -i /tmp/corrtest.dat -o /tmp/testoutcpu -d -p T
 
 multiple copies of the data can be piped into the correlator:
 
 cat /tmp/corrtest.dat /tmp/corrtest.dat /tmp/corrtest.dat /tmp/corrtest.dat | ./corr_gpu_complex -n 32 -w 10 -i - -o /tmp/testout
+
+
+
+
+Comparing/checking the test data
+--------------------------------
+
+n_chan=128
+n_time=10000
+n_inp=32
+n_prod=n_inp*(n_inp+1)//2
+
+tmp=numpy.fromfile('/tmp/corrtest.dat',dtype=numpy.int8)
+d2=(tmp[0::2] + 1j*tmp[1::2]).reshape(n_time,n_chan,n_inp).astype(numpy.complex64)
+
+fd2 = numpy.fft.fft(d2,axis=1) # don't reorder/transpose, just fft on a different axis
+
+
+# cross correlate, note implicit transpose of inner axes
+cprod=numpy.zeros((n_prod,n_chan),dtype=numpy.complex64)
+for t in range(n_time):
+    c_ind=0
+    for i in range(n_inp):
+        for j in range(i,n_inp):
+            cprod[c_ind,:] += fd2[t,:,i] * numpy.conj(fd2[t,:,j])
+            c_ind += 1
+
+cprod /= (n_time*n_chan)
+cprod = numpy.fft.fftshift(cprod,axes=1)
+
+# load the output of the ACC file for direct comparison
+gpuout=numpy.fromfile('/tmp/testout.ACC',dtype=numpy.complex64).reshape(n_prod,n_chan)
+cpuout=numpy.fromfile('/tmp/testoutcpu.ACC',dtype=numpy.complex64).reshape(n_prod,n_chan)
+
+import matplotlib.pyplot as plt
+
+plt.plot(numpy.real(cprod[0,:]),'x')
+plt.plot(numpy.real(gpuout[0,:]),'.')
+plt.plot(numpy.real(cpuout[0,:]),'+')
+plt.show()
+
+
+plt.plot(numpy.abs(cprod[1,:]),label='CPU abs')
+plt.plot(numpy.abs(cpuout[1,:]),label='CPUext abs')
+plt.plot(numpy.abs(gpuout[1,:]),label='GPU abs')
+plt.plot(numpy.angle(cprod[1,:]),'x',label='CPU pha')
+plt.plot(numpy.angle(cpuout[1,:]),'+',label='CPUext pha')
+plt.plot(numpy.angle(gpuout[1,:]),'.',label='GPU pha')
+plt.legend()
+plt.show()
+
+# print some diagnostics
+maxdiff = numpy.max(numpy.abs(gpuout-cprod))
+maxreldiff = numpy.max(numpy.abs(gpuout-cprod)/numpy.abs(gpuout))
+
+print("Max abs diff: %g. Max rel diff: %g" % (maxdiff,maxreldiff))
 
