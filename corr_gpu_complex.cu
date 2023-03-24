@@ -36,7 +36,7 @@
 #include <fcntl.h>
 
 #define MAX_THREADS 512
-#define MAX_INPUTS 256
+#define MAX_INPUTS 512
 #define MAX_CORR_PROD (MAX_INPUTS*(MAX_INPUTS+1)/2)
 #define MAX_CHAN (MAX_THREADS/4)    // this is limited by the number of threads that a GPU can support
 //#define GRPSIZ 2    // this cannot be changed from 2 without rewriting the 1xG CMAC function.
@@ -96,7 +96,6 @@ __global__ void unpack_data_GPU_MWA8bit_transpose(const int nchan,const int ninp
                 unsigned char *in_buf, cuFloatComplex *out_buf);
 static float elapsed_time(struct timeval *start);
 void printGPUDetails(FILE *fp);
-int init_CMAC_1x1(void);
 int init_CMAC_GxG(const int);
 
 /* global vars */
@@ -111,7 +110,8 @@ int cmac_method=CMAC_GxG_4;
 char *infilename=NULL,*outfilename=NULL;
 int prod_type='B';  /* correlation product type: B: both, C: cross, A: auto, T: triangle ACC format */
 //__device__ __constant__ uint2 inp_index_gpu[MAX_CORR_PROD]; // cannot fit for 256 inputs
-__device__ uint2 inp_index_gpu[MAX_CORR_PROD];
+__device__ ushort2 inp_index_gpu[MAX_CORR_PROD];
+ushort2 inp_index_cpu[MAX_CORR_PROD];
 
 
 /********************
@@ -617,7 +617,7 @@ void do_CMAC_gpu(int method, const int nchan, const int ninp, const int batchsiz
             }
         case CMAC_1x1: {
             if (!initialised) {
-                init_CMAC_1x1();
+                init_CMAC_GxG(1);
                 initialised=1;
             }
             dim3 dimBlock(nchan);
@@ -819,7 +819,7 @@ __global__ void do_CMAC_gpu_1xG_4(const int nchan, const int ninp, const int bat
 __global__ void do_CMAC_gpu_GxG(const int nchan, const int ninp, const int batchsize,
             cuFloatComplex * const ft_buf, cuFloatComplex * const corr_buf) {
 
-    uint2 inp_ind;
+    ushort2 inp_ind;
 
     /* fetch the pre-calculated input indexes for this correlation product.
        this comes from constant cache, so is fast. */
@@ -904,7 +904,7 @@ __global__ void do_CMAC_gpu_GxG(const int nchan, const int ninp, const int batch
 __global__ void do_CMAC_gpu_GxG_4(const int nchan, const int ninp, const int batchsize,
             cuFloatComplex * const ft_buf, cuFloatComplex * const corr_buf) {
 
-    uint2 inp_ind;
+    ushort2 inp_ind;
 
     /* fetch the pre-calculated input indexes for this correlation product.
        this comes from constant cache, so is fast. */
@@ -1000,7 +1000,7 @@ __global__ void do_CMAC_gpu_1x1(const int nchan, const int ninp, const int batch
 
     /* inputs (a,b) and result (c) */
     cuFloatComplex c;
-    uint2 inp_ind;
+    ushort2 inp_ind;
 
     /* fetch the pre-calculated input indexes for this correlation product.
        this comes from constant cache, so is fast. */
@@ -1037,34 +1037,9 @@ __global__ void do_CMAC_gpu_1x1(const int nchan, const int ninp, const int batch
 }
 
 
-/* initialise the input index lookup table for 1x1 CMAC */
-int init_CMAC_1x1(void) {
-    int i,j,cindex=0;
-    uint2 inp_index_cpu[MAX_CORR_PROD];
-    cudaError_t res;
-
-    /* zero entire array first */
-    memset(inp_index_cpu, '\0', sizeof(inp_index_cpu));
-
-    for(i=0; i<ninp; i++) {
-        for (j=i; j<ninp; j++){
-            inp_index_cpu[cindex] = make_uint2(i,j);
-            cindex++;
-        }
-    }
-    res = cudaMemcpyToSymbol(inp_index_gpu,inp_index_cpu,sizeof(inp_index_cpu));
-    if (res != cudaSuccess) {
-        fprintf(stderr,"Error on memcpy of inp_index to device. Message: %s\n",cudaGetErrorString(res));
-        return res;
-    }
-    return 0;
-}
-
-
 /* initialise the input index lookup table for GxG CMAC */
 int init_CMAC_GxG(const int grpsize) {
     int i,j,cindex=0;
-    uint2 inp_index_cpu[MAX_CORR_PROD];
     cudaError_t res;
     
     /* zero entire array first */
@@ -1072,7 +1047,7 @@ int init_CMAC_GxG(const int grpsize) {
 
     for(j=0; j<ninp/grpsize; j++) {
         for (i=j; i<ninp/grpsize; i++){
-            inp_index_cpu[cindex] = make_uint2(i,j);
+            inp_index_cpu[cindex] = make_ushort2(i,j);
             cindex++;
         }
     }
